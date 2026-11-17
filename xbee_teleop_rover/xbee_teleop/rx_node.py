@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+rx_node.py – XBee receiver for the rover (ROS 2).
+
+Receives combined MOTION packets from the base station over XBee and publishes:
+  /cmd_vel   (geometry_msgs/Twist)            – drive commands (vx, wz)
+  /arm_vel   (std_msgs/Float32MultiArray)     – arm commands [act1, act2, act3, wrist, gripper]
+
+Safety: publishes zeros on both topics if no packet arrives within cmd_timeout seconds.
+Also publishes diagnostic JSON on xbee_rx/status.
+
+Arm channel order in /arm_vel:
+  index 0 = act1    (linear actuator 1)
+  index 1 = act2    (linear actuator 2)
+  index 2 = act3    (linear actuator 3)
+  index 3 = wrist   (stepper motor)
+  index 4 = gripper (gear motor)
+Values: -1.0 (contract)  |  0.0 (still)  |  +1.0 (expand)
+"""
+import json
+import threading
+import time
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32MultiArray, String
+
+from xbee_teleop.link import XBeeLink, pack_ack, unpack
+
+
+class RxNode(Node):
+    def __init__(self):
+        super().__init__('rx_node')
+
+        # ------------------------------------------------------------------ #
+        # ROS parameters (override in config/params.yaml)
+        # ------------------------------------------------------------------ #
+        for k, v in dict(
+            port='/dev/ttyUSB0',
+            baud=115200,
+            remote_addr='',
+            cmd_timeout=0.5,
+            cmd_vel_topic='cmd_vel',
+            arm_vel_topic='arm_vel',   # topic for arm commands
+        ).items():
+            self.declare_parameter(k, v)
+        p = lambda n: self.get_parameter(n).value  # noqa: E731
+
+        # ------------------------------------------------------------------ #
+        # XBee link
+        # ------------------------------------------------------------------ #
+        self.link = XBeeLink(p('port'), p('baud'), p('remote_addr'), self.on_radio)
+
+        # ------------------------------------------------------------------ #
+        # Shared state (written by XBee thread, read by ROS timer thread)
+        # ------------------------------------------------------------------ #
+        self.lock = threading.Lock()
+
+        # Drive values
+        self.vx = 0.0
+        self.wz = 0.0
+
+        # Arm values: act1, act2, act3, wrist, gripper
+        self.act1    = 0.0
+        self.act2    = 0.0
+        self.act3    = 0.0
+        self.wrist   = 0.0
+        self.gripper = 0.0
+
+        # Packet tracking
+        self.seq     = None      # sequence number of last valid packet
+        self.lost    = 0         # cumulative lost packet count
+        self.last_rx = None      # monotonic time of the last valid command
+        self._last   = (time.monotonic(), 0)  # for rate calculation
+
+        # ------------------------------------------------------------------ #
+        # Publishers
+        # ------------------------------------------------------------------ #
+        self.drive_pub = self.create_publisher(Twist, p('cmd_vel_topic'), 10)
+        self.arm_pub   = self.create_publisher(Float32MultiArray, p('arm_vel_topic'), 10)
+        self.status_pub = self.create_publisher(String, 'xbee_rx/status', 10)
+
+        # ------------------------------------------------------------------ #
+        # Timers
+        # ------------------------------------------------------------------ #
+        self.create_timer(0.05, self.publish_cmd)      # 20 Hz: publish drive + arm
+        self.create_timer(0.5,  self.send_ack)         # 2 Hz:  send ACK to base station
+        self.create_timer(0.2,  self.publish_status)   # 5 Hz:  publish diagnostic JSON
+        self.create_timer(2.0,  self._reconnect)       # 0.5 Hz: auto-reconnect XBee
+
+        # ------------------------------------------------------------------ #
+        # Connect XBee
+        # ------------------------------------------------------------------ #
+        self.link.connect()
+        self.get_logger().info(
+            f'rx_node started — XBee port: {p("port")} @ {p("baud")} baud\n'
+            f'  Publishing drive commands on /{p("cmd_vel_topic")}\n'
+            f'  Publishing arm  commands on /{p("arm_vel_topic")}\n'
+            f'  Waiting for MOTION packets from base station...'
+        )
+
+    # ---------------------------------------------------------------------- #
+    # XBee receive callback (called from the XBee background thread)
+    # ---------------------------------------------------------------------- #
+    def on_radio(self, data):
+        """Decode incoming XBee packet and update shared state."""
+        m = unpack(data)
+        if not m:
+            return
+
+        with self.lock:
+            if m[0] == 'motion':
+                # New combined packet: drive + arm
+                _, seq, vx, wz, a1, a2, a3, wr, gr = m
+
+                # Count lost packets using rolling sequence number
+                if self.seq is not None:
+                    self.lost += (seq - self.seq - 1) & 0xFF
+
+                self.seq     = seq
+                self.vx, self.wz       = vx, wz
+                self.act1, self.act2   = a1, a2
+                self.act3, self.wrist  = a3, wr
+                self.gripper           = gr
+                self.last_rx           = time.monotonic()
+
+                # Print readable terminal output for every received packet
+                self.get_logger().info(
+                    f'[RX] seq={seq:3d} | '
+                    f'drive: vx={vx:+.3f}  wz={wz:+.3f} | '
+                    f'arm: act1={a1:+.0f}  act2={a2:+.0f}  act3={a3:+.0f}  '
+                    f'wrist={wr:+.0f}  gripper={gr:+.0f}'
+                )
+
+            elif m[0] == 'cmd':
+                # Legacy drive-only packet (backward compatibility)
+                _, seq, vx, wz = m
+
+                if self.seq is not None:
+                    self.lost += (seq - self.seq - 1) & 0xFF
+
+                self.seq = seq
+                self.vx, self.wz = vx, wz
+                # Arm values remain at their last state (or 0 if never set)
+                self.last_rx = time.monotonic()
+
+                self.get_logger().info(
+                    f'[RX legacy CMD] seq={seq:3d} | '
+                    f'drive: vx={vx:+.3f}  wz={wz:+.3f}'
+                )
+
+    # ---------------------------------------------------------------------- #
+    # Helpers
+    # ---------------------------------------------------------------------- #
+    def _age(self):
+        """Seconds since the last valid packet, or None if never received."""
+        return None if self.last_rx is None else time.monotonic() - self.last_rx
+
+    def _reconnect(self):
+        """Auto-reconnect the XBee link if it dropped."""
+        if not self.link.connected:
+            self.get_logger().warn('[rx_node] XBee not connected — retrying...')
+            self.link.connect()
+
+    # ---------------------------------------------------------------------- #
+    # Publish drive + arm commands (20 Hz)
+    # ---------------------------------------------------------------------- #
+    def publish_cmd(self):
+        """Publish /cmd_vel and /arm_vel. Publishes zeros on both if link is stale."""
+        with self.lock:
+            age    = self._age()
+            fresh  = age is not None and age < self.get_parameter('cmd_timeout').value
+            vx     = self.vx     if fresh else 0.0
+            wz     = self.wz     if fresh else 0.0
+            act1   = self.act1   if fresh else 0.0
+            act2   = self.act2   if fresh else 0.0
+            act3   = self.act3   if fresh else 0.0
+            wrist  = self.wrist  if fresh else 0.0
+            gripper= self.gripper if fresh else 0.0
+
+        # Drive command
+        drive_msg = Twist()
+        drive_msg.linear.x  = vx
+        drive_msg.angular.z = wz
+        self.drive_pub.publish(drive_msg)
+
+        # Arm command: [act1, act2, act3, wrist, gripper]
+        arm_msg = Float32MultiArray()
+        arm_msg.data = [act1, act2, act3, wrist, gripper]
+        self.arm_pub.publish(arm_msg)
+
+    # ---------------------------------------------------------------------- #
+    # Send ACK back to the base station (2 Hz)
+    # ---------------------------------------------------------------------- #
+    def send_ack(self):
+        """Send an ACK packet to the base station so it can track packet loss."""
+        if self.link.connected and self.seq is not None:
+            self.link.send(pack_ack(self.seq, self.lost))
+
+    # ---------------------------------------------------------------------- #
+    # Publish diagnostic status as JSON (5 Hz)
+    # ---------------------------------------------------------------------- #
+    def publish_status(self):
+        now = time.monotonic()
+        t0, n0 = self._last
+        rate = (self.link.rx - n0) / max(now - t0, 1e-3)
+        self._last = (now, self.link.rx)
+
+        with self.lock:
+            s = dict(
+                # Link
+                link=self.link.connected,
+                port=self.link.port,
+                baud=self.link.baud,
+                local=self.link.local_addr,
+                remote=self.link.remote_addr,
+                err=self.link.err,
+                # Reception stats
+                rx=self.link.rx,
+                ignored=self.link.rx_ignored,
+                last_src=self.link.last_src,
+                rate=round(rate, 1),
+                age=self._age(),
+                lost=self.lost,
+                seq=self.seq,
+                # Drive
+                vx=self.vx,
+                wz=self.wz,
+                # Arm
+                act1=self.act1,
+                act2=self.act2,
+                act3=self.act3,
+                wrist=self.wrist,
+                gripper=self.gripper,
+            )
+        self.status_pub.publish(String(data=json.dumps(s)))
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def main(args=None):
+    rclpy.init(args=args)
+    node = RxNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Safety: send zeros before shutting down
+        node.get_logger().info('[rx_node] Shutting down — publishing zero commands.')
+        if rclpy.ok():
+            node.drive_pub.publish(Twist())
+            arm_zero = Float32MultiArray()
+            arm_zero.data = [0.0, 0.0, 0.0, 0.0, 0.0]
+            node.arm_pub.publish(arm_zero)
+        node.link.close()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
