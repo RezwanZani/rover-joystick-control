@@ -256,10 +256,10 @@ class RxNode(Node):
                     return
 
             # CHANNEL PRIORITY SELECTION:
-            # - If XBee is healthy and this packet is from UDP: ignore UDP, let XBee drive!
-            # - If XBee has timed out / silent (>0.35s): execute UDP seamlessly!
-            # - As soon as XBee resumes: immediately accepts XBee and overrides UDP!
-            if source == 'UDP' and xbee_alive:
+            # - If XBee is healthy and this packet is from UDP: ignore UDP drive, let XBee drive!
+            # - If XBee has timed out / silent (>0.35s): execute UDP drive seamlessly!
+            # - Science and Mode packets over UDP are ALWAYS accepted!
+            if source == 'UDP' and xbee_alive and m[0] in ('motion', 'cmd'):
                 return
 
             # Accept and execute packet

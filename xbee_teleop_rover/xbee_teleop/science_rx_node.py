@@ -1,39 +1,34 @@
 #!/usr/bin/env python3
 """
-science_rx_node.py -- Network UDP Receiver for Rover Science Module (ROS 2).
+science_rx_node.py -- Dual-Redundant Receiver for Rover Science Module (ROS 2).
 
-Listens on a UDP socket (default 0.0.0.0:8889) for science commands sent over
-Wi-Fi / Ethernet from ground station GUIs, Python scripts, or socat.
+Reads Science commands over:
+  1. Primary:   XBee Radio (RF API frame 0x10 / 0x90 via serial)
+  2. Secondary: Network UDP Socket (Wi-Fi / Ethernet / socat on port 8889)
 
-Supports 4 command formats:
-  1. Structured ASCII string:
+Automatic Failover & Failback:
+  - While XBee is healthy, commands are executed strictly from XBee (redundant UDP ignored).
+  - If XBee communication fails/times out (>failover_timeout seconds) or is disconnected,
+    seamlessly fails over to Network UDP.
+  - As soon as XBee signal resumes, automatically fails back to XBee as primary.
+
+Supported Payload Formats:
+  1. Structured ASCII string (socat / echo):
      "S:1,0,0,0,0,1,90\n"  (m1, m2, m3, m4, m5, led, servo)
-     Example with socat:
-       echo "S:1,0,0,0,0,1,90" | socat - UDP-DATAGRAM:127.0.0.1:8889
+     Example: echo "S:1,0,0,0,0,1,90" | socat - UDP-DATAGRAM:127.0.0.1:8889
 
-  2. Binary struct (9 bytes, '<cBBBBBBBB'):
-     Byte 0: b'S'
-     Byte 1: seq (0..255)
-     Bytes 2-6: m1, m2, m3, m4, m5 (0 or 1)
-     Byte 7: led (0 or 1)
-     Byte 8: servo (0..180 deg)
+  2. Binary Struct (9 bytes, '<cBBBBBBBB'):
+     Byte 0: b'S', Byte 1: seq, Bytes 2-6: m1..m5, Byte 7: led, Byte 8: servo
 
-  3. JSON string:
-     '{"m1": 1, "m2": 0, "m3": 0, "m4": 0, "m5": 0, "led": 1, "servo": 90}'
+  3. JSON String:
+     '{"m1": 1, "led": 1, "servo": 90}'
 
-  4. Legacy single-character shortcuts:
-     'x' = Motor 1 ON, 'c' = M1+M2 ON, 'v' = M1..M3 ON, 'b' = M1..M4 ON,
-     'n' = All 5 Motors ON, 'z' = All Motors OFF,
-     '1' = LED ON, '2' = LED OFF,
-     '3' = Servo 0°, '4' = Servo 180°
+  4. Single-char Shortcuts (Arduino Mega sketch compatibility):
+     'x' = M1 ON, 'z' = All OFF, '1' = LED ON, '2' = LED OFF, etc.
 
 Publishes:
   /science/actuator_cmd    (std_msgs/UInt8MultiArray) -- [m1, m2, m3, m4, m5, led, servo]
-  /science/actuator_status (std_msgs/String)          -- JSON feedback
-
-Optional direct serial link to Arduino Mega:
-  If direct_serial=True and an Arduino is detected at arduino_port, sends
-  "S:m1,m2,m3,m4,m5,led,servo\n" straight to serial as well.
+  /science/actuator_status (std_msgs/String)          -- JSON status with active_source & link health
 """
 import json
 import os
@@ -47,7 +42,8 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, UInt8MultiArray
 
-# Binary 9-byte packet struct layout
+from xbee_teleop.link import XBeeLink, unpack
+
 _SCIENCE_STRUCT = struct.Struct('<cBBBBBBBB')
 
 
@@ -55,7 +51,13 @@ class ScienceRxNode(Node):
     def __init__(self):
         super().__init__('science_rx_node')
 
-        # Parameters
+        # ------------------------------------------------------------------ #
+        # ROS 2 Parameters
+        # ------------------------------------------------------------------ #
+        self.declare_parameter('xbee_port', '/dev/ttyUSB0')
+        self.declare_parameter('xbee_baud', 115200)
+        self.declare_parameter('remote_addr', '')
+        self.declare_parameter('failover_timeout', 1.0)
         self.declare_parameter('udp_ip', '0.0.0.0')
         self.declare_parameter('udp_port', 8889)
         self.declare_parameter('cmd_topic', '/science/actuator_cmd')
@@ -67,6 +69,10 @@ class ScienceRxNode(Node):
 
         p = lambda n: self.get_parameter(n).value
 
+        self.xbee_port = str(p('xbee_port')).strip()
+        self.xbee_baud = int(p('xbee_baud'))
+        self.remote_addr = str(p('remote_addr')).strip()
+        self.failover_timeout = float(p('failover_timeout'))
         self.udp_ip = str(p('udp_ip'))
         self.udp_port = int(p('udp_port'))
         self.cmd_topic = str(p('cmd_topic'))
@@ -76,7 +82,7 @@ class ScienceRxNode(Node):
         self.arduino_port = str(p('arduino_port'))
         self.arduino_baud = int(p('arduino_baud'))
 
-        # State storage (m1..m5: 0/1, led: 0/1, servo: 0..180)
+        # Shared state storage
         self.lock = threading.Lock()
         self.state = {
             'm1': 0, 'm2': 0, 'm3': 0, 'm4': 0, 'm5': 0,
@@ -84,33 +90,48 @@ class ScienceRxNode(Node):
         }
         self.seq = 0
         self.last_rx = 0.0
+        self.last_xbee_rx = None
+        self.last_udp_rx = None
+        self.active_source = 'DISCONNECTED'   # 'XBEE' | 'UDP' | 'DISCONNECTED'
+        self.failover_count = 0
         self.last_sender = None
 
         # ROS 2 Publishers
         self.cmd_pub = self.create_publisher(UInt8MultiArray, self.cmd_topic, 10)
         self.status_pub = self.create_publisher(String, self.status_topic, 10)
 
-        # Optional Arduino Mega direct serial connection
-        self.ser = None
+        # Direct Arduino Serial (optional)
+        self.arduino_ser = None
         if self.direct_serial:
-            self._connect_serial()
+            self._connect_arduino_serial()
 
-        # UDP Socket & Receiver Thread
+        # Primary Link: XBee Radio
+        self.xbee_link = None
+        if self.xbee_port and self.xbee_port.lower() not in ('none', 'false', 'disabled', ''):
+            self.xbee_link = XBeeLink(self.xbee_port, self.xbee_baud, self.remote_addr, self.on_xbee_data)
+            self.xbee_link.connect()
+
+        # Secondary Link: UDP Network Socket
         self.udp_running = True
         self.sock = None
         self._init_udp()
 
-        # Periodic status publisher timer (1 Hz)
+        # Watchdog & Status Timers
         self.create_timer(1.0, self.publish_status)
+        self.create_timer(2.0, self._watchdog)
 
         self.get_logger().info(
             f"🔬 [ScienceRxNode] Started:\n"
-            f"   Listening on UDP: {self.udp_ip}:{self.udp_port}\n"
-            f"   Publishing cmd : {self.cmd_topic} (UInt8MultiArray)\n"
-            f"   Publishing stat: {self.status_topic} (String/JSON)\n"
-            f"   Direct serial  : {self.direct_serial} ({self.arduino_port} @ {self.arduino_baud})"
+            f"   Primary Link   : XBee on {self.xbee_port or 'DISABLED'} @ {self.xbee_baud}\n"
+            f"   Secondary Link : UDP on {self.udp_ip}:{self.udp_port} (Wi-Fi/Ethernet/socat)\n"
+            f"   Failover Window: {self.failover_timeout:.1f} s (XBee Priority -> UDP Failover -> XBee Failback)\n"
+            f"   Publishing Cmd : {self.cmd_topic} (UInt8MultiArray)\n"
+            f"   Publishing Stat: {self.status_topic} (String/JSON)"
         )
 
+    # ---------------------------------------------------------------------- #
+    # Hardware Link Initializers & Watchdogs
+    # ---------------------------------------------------------------------- #
     def _init_udp(self):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -119,21 +140,33 @@ class ScienceRxNode(Node):
             self.sock.settimeout(0.5)
             self.rx_thread = threading.Thread(target=self._udp_loop, daemon=True)
             self.rx_thread.start()
-            self.get_logger().info(f"✅ UDP socket successfully bound to {self.udp_ip}:{self.udp_port}")
+            self.get_logger().info(f"✅ Secondary UDP receiver bound to {self.udp_ip}:{self.udp_port}")
         except Exception as e:
             self.get_logger().error(f"❌ Failed to bind UDP socket on {self.udp_port}: {e}")
 
-    def _connect_serial(self):
+    def _connect_arduino_serial(self):
         try:
             import serial
-            self.ser = serial.Serial(self.arduino_port, self.arduino_baud, timeout=0.1)
-            self.get_logger().info(f"✅ Connected directly to Science Arduino on {self.arduino_port} @ {self.arduino_baud}")
+            self.arduino_ser = serial.Serial(self.arduino_port, self.arduino_baud, timeout=0.1)
+            self.get_logger().info(f"✅ Connected to Science Arduino on {self.arduino_port} @ {self.arduino_baud}")
         except Exception as e:
-            self.ser = None
-            self.get_logger().warn(f"⚠️ Direct serial to Arduino unavailable ({e}). Continuing in ROS-only mode.")
+            self.arduino_ser = None
+            self.get_logger().warn(f"⚠️ Direct Arduino serial unavailable ({e}). Continuing in ROS-only mode.")
+
+    def _watchdog(self):
+        """Auto-reconnect XBee radio if disconnected or port plugged in late."""
+        if self.xbee_link and not self.xbee_link.connected:
+            self.xbee_link.connect()
+
+    # ---------------------------------------------------------------------- #
+    # Receiver Callbacks
+    # ---------------------------------------------------------------------- #
+    def on_xbee_data(self, data: bytes):
+        """Callback from XBee serial thread when an RF packet arrives."""
+        self.process_packet(data, source='XBEE', sender_info='XBEE_RF')
 
     def _udp_loop(self):
-        """Continuously receive UDP packets and dispatch commands."""
+        """Continuous background thread receiving UDP network datagrams."""
         while self.udp_running and rclpy.ok():
             if not self.sock:
                 time.sleep(0.5)
@@ -142,7 +175,8 @@ class ScienceRxNode(Node):
                 data, addr = self.sock.recvfrom(4096)
                 if not data:
                     continue
-                self.process_payload(data, addr)
+                sender_str = f"{addr[0]}:{addr[1]}"
+                self.process_packet(data, source='UDP', sender_info=sender_str, sender_addr=addr)
             except socket.timeout:
                 continue
             except Exception as e:
@@ -150,16 +184,26 @@ class ScienceRxNode(Node):
                     self.get_logger().debug(f"UDP rx error: {e}")
                 time.sleep(0.1)
 
+    # ---------------------------------------------------------------------- #
+    # Packet Parsers
+    # ---------------------------------------------------------------------- #
     def parse_command(self, raw_data: bytes):
-        """
-        Parses raw bytes into a dictionary with keys:
-          'm1', 'm2', 'm3', 'm4', 'm5', 'led', 'servo'
-        Returns parsed dict or None if invalid.
-        """
+        """Parses raw bytes into dict of {'m1'..'m5', 'led', 'servo', '_seq'} or None."""
         if not raw_data:
             return None
 
-        # 1. Binary struct: 9 bytes starting with 'S'
+        # 1. Standard unpack helper ('science' packet from link.py or 9-byte struct)
+        m = unpack(raw_data)
+        if m and m[0] == 'science':
+            _, seq, m1, m2, m3, m4, m5, led, servo = m
+            return {
+                'm1': int(bool(m1)), 'm2': int(bool(m2)), 'm3': int(bool(m3)),
+                'm4': int(bool(m4)), 'm5': int(bool(m5)), 'led': int(bool(led)),
+                'servo': max(0, min(180, int(servo))),
+                '_seq': seq
+            }
+
+        # Raw binary struct fallback
         if len(raw_data) == _SCIENCE_STRUCT.size and raw_data[:1] == b'S':
             try:
                 _, seq, m1, m2, m3, m4, m5, led, servo = _SCIENCE_STRUCT.unpack(raw_data)
@@ -172,12 +216,12 @@ class ScienceRxNode(Node):
             except Exception:
                 pass
 
-        # Decode to text
+        # Text decoders
         text = raw_data.decode('utf-8', errors='ignore').strip()
         if not text:
             return None
 
-        # 2. JSON string: '{"m1": 1, ...}'
+        # 2. JSON string
         if text.startswith('{') and text.endswith('}'):
             try:
                 obj = json.loads(text)
@@ -226,7 +270,7 @@ class ScienceRxNode(Node):
             if res:
                 return res
 
-        # 5. Legacy single-character commands (compat with Arduino sketch):
+        # 5. Single-character shortcuts (from Arduino Mega sketch)
         ch = text.strip()
         if len(ch) == 1:
             res = {}
@@ -245,47 +289,96 @@ class ScienceRxNode(Node):
 
         return None
 
-    def process_payload(self, raw_data: bytes, sender_addr):
+    # ---------------------------------------------------------------------- #
+    # Core Failover & Execution Engine
+    # ---------------------------------------------------------------------- #
+    def process_packet(self, raw_data: bytes, source: str, sender_info: str, sender_addr=None):
+        """Unified packet handler implementing:
+          1. XBee priority
+          2. Seamless failover to Network UDP on XBee timeout / silence (>failover_timeout)
+          3. Immediate failback to XBee upon XBee signal restoration
+        """
         parsed = self.parse_command(raw_data)
         if not parsed:
-            self.get_logger().debug(f"Unrecognized payload from {sender_addr}: {raw_data[:32]!r}")
             return
 
+        now = time.monotonic()
         with self.lock:
-            # Update state with incoming parameters
+            if source == 'XBEE':
+                self.last_xbee_rx = now
+            elif source == 'UDP':
+                self.last_udp_rx = now
+
+            xbee_alive = (
+                (self.last_xbee_rx is not None)
+                and ((now - self.last_xbee_rx) < self.failover_timeout)
+            )
+
+            # FAILOVER SELECTION:
+            # If XBee is active and this command arrived from UDP: ignore UDP, let XBee rule!
+            if source == 'UDP' and xbee_alive:
+                self.get_logger().debug(f"[UDP Dropped] XBee is healthy and primary ({sender_info}).")
+                # Still send UDP confirmation back if requested
+                if self.send_reply and sender_addr and self.sock:
+                    try:
+                        m1, m2, m3, m4, m5 = (self.state[f'm{i}'] for i in range(1, 6))
+                        led, servo = self.state['led'], self.state['servo']
+                        reply = f"STATUS:m1={m1},m2={m2},m3={m3},m4={m4},m5={m5},led={led},servo={servo},src=XBEE_PRIMARY\n".encode('ascii')
+                        self.sock.sendto(reply, sender_addr)
+                    except Exception:
+                        pass
+                return
+
+            # FAILOVER LOGGING:
+            # Check state transitions
+            if source == 'UDP' and self.active_source == 'XBEE':
+                self.failover_count += 1
+                self.get_logger().warn(
+                    f"⚠️ [FAILOVER -> UDP] XBee silent for >{self.failover_timeout:.1f} s! "
+                    f"Seamlessly switched to Network UDP ({sender_info})."
+                )
+            elif source == 'XBEE' and self.active_source == 'UDP':
+                self.get_logger().info(
+                    f"🔄 [FAILBACK -> XBEE] XBee signal restored! "
+                    f"Immediately switched back to Primary XBee."
+                )
+
+            self.active_source = source
+            self.last_rx = now
+            self.last_sender = sender_info
+
+            # Apply parameters
             for k in ('m1', 'm2', 'm3', 'm4', 'm5', 'led', 'servo'):
                 if k in parsed:
                     self.state[k] = parsed[k]
             self.seq = parsed.get('_seq', (self.seq + 1) & 0xFF)
-            self.last_rx = time.monotonic()
-            self.last_sender = sender_addr
 
             m1, m2, m3, m4, m5 = (self.state[f'm{i}'] for i in range(1, 6))
             led = self.state['led']
             servo = self.state['servo']
 
-        # 1. Publish to ROS 2 topic: /science/actuator_cmd (UInt8MultiArray)
+        # 1. Publish to ROS 2 topic: /science/actuator_cmd (std_msgs/UInt8MultiArray)
         cmd_msg = UInt8MultiArray()
         cmd_msg.data = [m1, m2, m3, m4, m5, led, servo]
         self.cmd_pub.publish(cmd_msg)
 
-        # 2. Forward to direct serial if enabled
-        if self.direct_serial and self.ser and self.ser.is_open:
+        # 2. Forward to direct Arduino serial if enabled
+        if self.direct_serial and self.arduino_ser and self.arduino_ser.is_open:
             try:
                 line = f"S:{m1},{m2},{m3},{m4},{m5},{led},{servo}\n".encode('ascii')
-                self.ser.write(line)
+                self.arduino_ser.write(line)
             except Exception as e:
                 self.get_logger().warn(f"Direct serial write failed: {e}")
 
         # 3. Log to console
         self.get_logger().info(
-            f"🔬 [SCIENCE UDP RX from {sender_addr[0]}:{sender_addr[1]}] "
+            f"🔬 [SCIENCE CMD via {source} from {sender_info}] "
             f"M1:{m1} M2:{m2} M3:{m3} M4:{m4} M5:{m5} | LED:{led} | SERVO:{servo}° "
             f"-> Published {self.cmd_topic}"
         )
 
-        # 4. Send acknowledgment back over UDP (useful for socat / clients)
-        if self.send_reply and self.sock:
+        # 4. If UDP, send acknowledgment back over network
+        if source == 'UDP' and self.send_reply and sender_addr and self.sock:
             try:
                 reply = f"STATUS:m1={m1},m2={m2},m3={m3},m4={m4},m5={m5},led={led},servo={servo}\n".encode('ascii')
                 self.sock.sendto(reply, sender_addr)
@@ -297,11 +390,24 @@ class ScienceRxNode(Node):
 
     def publish_status(self):
         """Publish JSON status string to /science/actuator_status."""
+        now = time.monotonic()
         with self.lock:
             st = dict(self.state)
             st['seq'] = self.seq
-            st['last_rx_age'] = round(time.monotonic() - self.last_rx, 2) if self.last_rx > 0 else None
-            st['sender'] = f"{self.last_sender[0]}:{self.last_sender[1]}" if self.last_sender else None
+            st['active_source'] = self.active_source
+            st['failover_count'] = self.failover_count
+            st['last_rx_age'] = round(now - self.last_rx, 2) if self.last_rx > 0 else None
+            st['xbee_connected'] = (self.xbee_link is not None and self.xbee_link.connected)
+            st['xbee_alive'] = (
+                (self.last_xbee_rx is not None)
+                and ((now - self.last_xbee_rx) < self.failover_timeout)
+                and st['xbee_connected']
+            )
+            st['udp_alive'] = (
+                (self.last_udp_rx is not None)
+                and ((now - self.last_udp_rx) < self.failover_timeout)
+            )
+            st['sender'] = self.last_sender
 
         msg = String()
         msg.data = json.dumps(st)
@@ -314,9 +420,14 @@ class ScienceRxNode(Node):
                 self.sock.close()
             except Exception:
                 pass
-        if self.ser and self.ser.is_open:
+        if self.xbee_link:
             try:
-                self.ser.close()
+                self.xbee_link.close()
+            except Exception:
+                pass
+        if self.arduino_ser and self.arduino_ser.is_open:
+            try:
+                self.arduino_ser.close()
             except Exception:
                 pass
         super().destroy_node()

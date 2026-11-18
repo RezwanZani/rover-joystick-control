@@ -25,6 +25,7 @@ setup(
             'tx_node = xbee_teleop.tx_node:main',
             'rx_node = xbee_teleop.rx_node:main',
             'science_node = xbee_teleop.science_node:main',
+            'science_rx_node = xbee_teleop.science_rx_node:main',
             'gui = xbee_teleop.gui:main',
             'xbee_check = xbee_teleop.xbee_check:main',
         ],

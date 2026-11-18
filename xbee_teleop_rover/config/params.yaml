@@ -42,3 +42,21 @@ rx_node:                          # robot
     arm_vel_topic: arm_vel        # arm command topic (Float32MultiArray)
                                   # data = [act1, act2, act3, wrist, gripper]
                                   # values: -1.0 contract | 0.0 still | +1.0 expand
+
+science_rx_node:                  # Science UDP network receiver
+  ros__parameters:
+    udp_ip: "0.0.0.0"
+    udp_port: 8889                # Dedicated UDP port for science commands
+    cmd_topic: /science/actuator_cmd       # std_msgs/UInt8MultiArray [m1,m2,m3,m4,m5,led,servo]
+    status_topic: /science/actuator_status # std_msgs/String JSON status
+    send_reply: true              # Send UDP status reply back to sender (socat/GUI)
+    direct_serial: false          # Set true to write directly to Arduino serial
+    arduino_port: /dev/ttyACM0
+    arduino_baud: 9600
+
+science_node:                     # Arduino Mega serial bridge
+  ros__parameters:
+    port: /dev/ttyACM0
+    baud: 9600
+    cmd_topic: /science/actuator_cmd
+    status_topic: /science/actuator_status
