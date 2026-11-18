@@ -357,7 +357,8 @@ class RxNode(Node):
         """Auto-reconnect the XBee link and rebind UDP socket if either has dropped."""
         try:
             if not self.link.connected:
-                self.get_logger().warn('[rx_node] XBee not connected — retrying...')
+                err_str = f" ({self.link.err})" if self.link.err else ""
+                self.get_logger().warn(f'[rx_node] XBee not connected on {self.link.port}{err_str} — retrying...')
                 self.link.connect()
         except Exception as e:
             self.get_logger().debug(f'[rx_node] XBee reconnect error: {e}')
