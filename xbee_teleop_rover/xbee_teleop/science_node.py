@@ -87,28 +87,37 @@ class ScienceNode(Node):
         Does NOT update status optimistically; actual status is only updated
         when confirmed by the Arduino Mega over serial.
         """
-        if not msg.data or len(msg.data) < 6:
-            return
+        try:
+            if not msg.data or len(msg.data) < 6:
+                return
 
-        m1 = int(msg.data[0])
-        m2 = int(msg.data[1])
-        m3 = int(msg.data[2])
-        m4 = int(msg.data[3])
-        m5 = int(msg.data[4])
-        led = int(msg.data[5])
-        servo = int(msg.data[6]) if len(msg.data) > 6 else 0
+            m1 = int(msg.data[0])
+            m2 = int(msg.data[1])
+            m3 = int(msg.data[2])
+            m4 = int(msg.data[3])
+            m5 = int(msg.data[4])
+            led = int(msg.data[5])
+            servo = int(msg.data[6]) if len(msg.data) > 6 else 0
 
-        cmd_str = f"S:{m1},{m2},{m3},{m4},{m5},{led},{servo}\n"
+            cmd_str = f"S:{m1},{m2},{m3},{m4},{m5},{led},{servo}\n"
 
-        with self.lock:
-            if self.ser and self.ser.is_open:
-                try:
-                    self.ser.write(cmd_str.encode('ascii'))
-                    self.get_logger().info(f"Sent to Arduino Mega: {cmd_str.strip()}")
-                except Exception as e:
-                    self.get_logger().warn(f"Failed to write to Arduino: {e}")
-            else:
-                self.get_logger().warn("Arduino Mega not connected — command not sent.")
+            with self.lock:
+                if self.ser and self.ser.is_open:
+                    try:
+                        self.ser.write(cmd_str.encode('ascii'))
+                        self.get_logger().info(f"Sent to Arduino Mega: {cmd_str.strip()}")
+                    except Exception as e:
+                        self.get_logger().warn(f"Failed to write to Arduino: {e} — marking disconnected")
+                        try:
+                            self.ser.close()
+                        except Exception:
+                            pass
+                        self.ser = None
+                        self.last_status["connected"] = False
+                else:
+                    self.get_logger().warn("Arduino Mega not connected — command not sent.")
+        except Exception as e:
+            self.get_logger().debug(f'[on_cmd] Unexpected error: {e}')
 
     def _serial_loop(self):
         """Background thread to read serial responses from Arduino Mega."""
@@ -173,11 +182,14 @@ class ScienceNode(Node):
             self._publish_latest_status()
 
     def _publish_latest_status(self):
-        with self.lock:
-            payload = dict(self.last_status)
-        msg = String()
-        msg.data = json.dumps(payload)
-        self.status_pub.publish(msg)
+        try:
+            with self.lock:
+                payload = dict(self.last_status)
+            msg = String()
+            msg.data = json.dumps(payload)
+            self.status_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().debug(f'[_publish_latest_status] Error: {e}')
 
     def destroy_node(self):
         self.running = False
