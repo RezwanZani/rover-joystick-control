@@ -1,4 +1,4 @@
-"""XBee link (radio must be in API mode, AP=1) + packet helpers.
+"""XBee link (radio in API mode, AP=1) + packet helpers.
 
 Packet types
 ------------
@@ -7,15 +7,16 @@ Packet types
                                    act1 i16, act2 i16, act3 i16, wrist i16, gripper i16
   ACK    RX -> TX ('A')         : last seq u8, lost u16
 
-All i16 values are stored as (real_value * 1000), giving ±32.767 m/s / rad/s / units.
-Arm channels use discrete steps: -1000 (contract), 0 (still), +1000 (expand).
+Transport
+---------
+  Pure non-blocking serial (timeout=0, write_timeout=0).
+  XBee API frame 0x10 with Frame ID 0x00 and Option 0x01 (Disable RF ACK)
+  to ensure zero-stutter 20 Hz teleop alongside heavy RTCM or bidirectional data.
 """
 import struct
-
-from digi.xbee.devices import RemoteXBeeDevice, XBeeDevice
-from digi.xbee.models.address import XBee64BitAddress
-from digi.xbee.models.status import TransmitStatus
-from digi.xbee.packets.common import TransmitStatusPacket
+import threading
+import time
+import serial
 
 # ---------------------------------------------------------------------------
 # Struct layouts (little-endian)
@@ -32,6 +33,12 @@ _MOTION = struct.Struct('<cBhhhhhhh')
 
 # ACK from rover to base station: 'A' last_seq lost  (5 bytes)
 _ACK = struct.Struct('<cBH')
+
+# Science actuator packet: 'S' seq m1 m2 m3 m4 m5 led servo  (9 bytes)
+_SCIENCE = struct.Struct('<cBBBBBBBB')
+
+# Operational mode packet: 'N' seq mode  (3 bytes: 0=TELEOP, 1=AUTONOMOUS)
+_MODE = struct.Struct('<cBB')
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +78,22 @@ def pack_ack(seq, lost):
     return _ACK.pack(b'A', seq & 0xFF, lost & 0xFFFF)
 
 
+def pack_science(seq, m1, m2, m3, m4, m5, led, servo):
+    """Pack Science actuator command packet ('S', 9 bytes)."""
+    return _SCIENCE.pack(
+        b'S', seq & 0xFF,
+        int(bool(m1)), int(bool(m2)), int(bool(m3)), int(bool(m4)), int(bool(m5)),
+        int(bool(led)), max(0, min(180, int(servo)))
+    )
+
+
+def pack_mode(seq, mode):
+    """Pack Rover operational mode toggle packet ('N', 3 bytes).
+    mode: 0 = TELEOP, 1 = AUTONOMOUS
+    """
+    return _MODE.pack(b'N', seq & 0xFF, int(mode) & 0xFF)
+
+
 # ---------------------------------------------------------------------------
 # Unpack (handles all packet types)
 # ---------------------------------------------------------------------------
@@ -80,6 +103,8 @@ def unpack(data):
     Returns one of:
       ('motion', seq, vx, wz, act1, act2, act3, wrist, gripper)  -- new combined packet
       ('cmd',    seq, vx, wz)                                     -- legacy drive-only
+      ('science', seq, m1, m2, m3, m4, m5, led, servo)           -- science actuators
+      ('mode',    seq, mode)                                      -- operational mode
       ('ack',    seq, lost)                                        -- rover ACK
       None                                                         -- unknown / corrupt
     """
@@ -98,6 +123,16 @@ def unpack(data):
         _, seq, vx, wz = _CMD.unpack(data)
         return ('cmd', seq, vx / 1000.0, wz / 1000.0)
 
+    # Science actuator packet
+    if data[:1] == b'S' and len(data) == _SCIENCE.size:
+        _, seq, m1, m2, m3, m4, m5, led, servo = _SCIENCE.unpack(data)
+        return ('science', seq, m1, m2, m3, m4, m5, led, servo)
+
+    # Operational mode packet
+    if data[:1] == b'N' and len(data) == _MODE.size:
+        _, seq, mode = _MODE.unpack(data)
+        return ('mode', seq, mode)
+
     # ACK from rover
     if data[:1] == b'A' and len(data) == _ACK.size:
         _, seq, lost = _ACK.unpack(data)
@@ -106,8 +141,39 @@ def unpack(data):
     return None
 
 
+
 def norm_addr(a):
     return str(a).strip().upper().replace('0X', '').zfill(16)
+
+
+def wrap_xbee_api_tx(raw_payload: bytes, dest_addr_hex: str = '') -> bytes:
+    """Build an XBee API mode (AP=1) Transmit Request frame (type 0x10).
+
+    Settings:
+      - 0x10 = Transmit Request
+      - 0x00 = Frame ID (0 disables transmit status 0x8B callback, eliminating serial overhead)
+      - dest_addr = 64-bit Address (defaults to 00..FFFF broadcast)
+      - FF FE = 16-bit Broadcast
+      - 0x00 = Broadcast Radius
+      - 0x01 = Disable RF ACK (CRITICAL for fixing 20 Hz loop freeze and stutter)
+    """
+    clean_hex = dest_addr_hex.strip().upper().replace('0X', '').zfill(16) if dest_addr_hex else ''
+    if clean_hex and len(clean_hex) == 16 and clean_hex != '000000000000FFFF':
+        dest_bytes = bytes.fromhex(clean_hex)
+    else:
+        dest_bytes = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF])
+
+    header = bytes([
+        0x10, 0x00,
+        dest_bytes[0], dest_bytes[1], dest_bytes[2], dest_bytes[3],
+        dest_bytes[4], dest_bytes[5], dest_bytes[6], dest_bytes[7],
+        0xFF, 0xFE,
+        0x00, 0x01
+    ])
+    frame_data = header + raw_payload
+    length = len(frame_data)
+    checksum = 0xFF - (sum(frame_data) & 0xFF)
+    return struct.pack('>BH', 0x7E, length) + frame_data + bytes([checksum])
 
 
 def get_controller_state(buttons, raw_axes, hats=None):
@@ -193,69 +259,176 @@ def get_controller_state(buttons, raw_axes, hats=None):
 
 
 class XBeeLink:
+    """Non-blocking, zero-stutter XBee API serial link.
+
+    - Uses write_timeout=0 to guarantee serial.write() never blocks the 20 Hz loop.
+    - Sends 0x10 Transmit Request with Frame ID 0x00 and Option 0x01 (Disable RF ACK).
+    - Runs a background thread parsing incoming 0x90 Receive Packet frames.
+    """
+
     def __init__(self, port, baud, remote_addr, on_message):
-        self.port, self.baud = port, int(baud)
-        self.remote_addr = norm_addr(remote_addr)
-        self.on_message = on_message            # on_message(bytes), called from the XBee thread
-        self.dev = self.remote = None
+        self.port = port
+        self.baud = int(baud)
+        self.remote_addr = norm_addr(remote_addr) if remote_addr else ''
+        self.on_message = on_message            # callback: on_message(bytes)
+        self.ser = None
+        self.running = False
+        self.thread = None
         self.local_addr = ''
         self.err = ''
-        self.sent = self.tx_ok = self.tx_fail = 0   # frames sent / delivered / failed
-        self.rx = self.rx_ignored = 0               # frames accepted / from a wrong address
+        self.sent = self.tx_ok = self.tx_fail = 0
+        self.rx = self.rx_ignored = 0
         self.last_src = ''
+        self.last_fail = ''
 
     @property
     def connected(self):
-        return self.dev is not None
+        return self.ser is not None and self.ser.is_open
 
     def connect(self):
+        self.close()
         try:
-            dev = XBeeDevice(self.port, self.baud)
-            dev.open()
-            dev.set_sync_ops_timeout(1.0)
-            dev.add_data_received_callback(self._on_data)
-            dev.add_packet_received_callback(self._on_packet)
-            self.remote = RemoteXBeeDevice(dev, XBee64BitAddress.from_hex_string(self.remote_addr))
-            self.local_addr = str(dev.get_64bit_addr())
-            self.dev, self.err = dev, ''
-        except Exception as e:  # noqa: BLE001 - show any reason in the GUI
-            msg = str(e) or type(e).__name__
-            if 'operating mode' in msg.lower():
-                msg += '  -> radio not in API mode: run  ros2 run xbee_teleop xbee_check <port> <baud> --fix'
-            self.err, self.dev = msg, None
+            # write_timeout=0 ensures write() never freezes if serial buffer fills
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                timeout=0,
+                write_timeout=0
+            )
+            self.running = True
+            self.err = ''
+            self.thread = threading.Thread(target=self._rx_loop, daemon=True)
+            self.thread.start()
+            self._query_local_addr()
+        except Exception as e:
+            self.err = str(e)
+            self.ser = None
 
-    def send(self, payload):
-        if not self.dev:
+    def send(self, payload, dest_addr=None):
+        """Send payload wrapped in an XBee API 0x10 frame (non-blocking, no RF ACK)."""
+        if not self.ser or not self.ser.is_open:
             return False
         try:
-            self.dev.send_data_async(self.remote, payload)
+            target = dest_addr if dest_addr is not None else self.remote_addr
+            frame = wrap_xbee_api_tx(payload, target)
+            self.ser.write(frame)
             self.sent += 1
+            self.tx_ok += 1
             return True
-        except Exception as e:  # noqa: BLE001
-            self.err = f'send failed: {e}'
-            self.close()
+        except (serial.SerialTimeoutException, serial.SerialException) as e:
+            # Dropped cleanly without blocking or freezing the loop
+            self.tx_fail += 1
+            self.last_fail = str(e)
+            return False
+        except Exception as e:
+            self.tx_fail += 1
+            self.last_fail = str(e)
             return False
 
-    def _on_data(self, msg):
-        src = str(msg.remote_device.get_64bit_addr())
-        self.last_src = src
-        if src != self.remote_addr:
-            self.rx_ignored += 1
-            return
-        self.rx += 1
-        self.on_message(bytes(msg.data))
+    def _query_local_addr(self):
+        """Query local 64-bit address using AT SH and AT SL frames."""
+        try:
+            for cmd in (b'SH', b'SL'):
+                frame_data = bytes([0x08, 0x01]) + cmd
+                length = len(frame_data)
+                chk = 0xFF - (sum(frame_data) & 0xFF)
+                pkt = struct.pack('>BH', 0x7E, length) + frame_data + bytes([chk])
+                self.ser.write(pkt)
+                time.sleep(0.02)
+        except Exception:
+            pass
 
-    def _on_packet(self, pkt):
-        if isinstance(pkt, TransmitStatusPacket):
-            if pkt.transmit_status == TransmitStatus.SUCCESS:
-                self.tx_ok += 1
+    def _rx_loop(self):
+        """Background thread reading and parsing incoming API frames."""
+        buf = bytearray()
+        while self.running and self.ser and self.ser.is_open:
+            try:
+                chunk = self.ser.read(256)
+                if not chunk:
+                    time.sleep(0.005)
+                    continue
+                buf.extend(chunk)
+
+                # Parse all complete 0x7E frames in the buffer
+                while len(buf) >= 4:
+                    try:
+                        idx = buf.index(0x7E)
+                    except ValueError:
+                        buf.clear()
+                        break
+                    if idx > 0:
+                        del buf[:idx]
+
+                    if len(buf) < 4:
+                        break
+
+                    length = (buf[1] << 8) | buf[2]
+                    total_len = 3 + length + 1
+
+                    if len(buf) < total_len:
+                        break  # Incomplete frame, wait for more bytes
+
+                    frame_data = bytes(buf[3:3 + length])
+                    chk = buf[3 + length]
+                    calc_chk = 0xFF - (sum(frame_data) & 0xFF)
+
+                    del buf[:total_len]
+
+                    if chk != calc_chk:
+                        continue  # Checksum mismatch, discard
+
+                    self._handle_frame(frame_data)
+
+            except Exception:
+                if not self.running:
+                    break
+                time.sleep(0.01)
+
+    def _handle_frame(self, frame_data):
+        if not frame_data:
+            return
+        frame_type = frame_data[0]
+
+        # 0x90 = Receive Packet (Physical RF RX) or 0x10 = Transmit Request (Direct Loopback / SIL)
+        if frame_type in (0x90, 0x10) and len(frame_data) >= (12 if frame_type == 0x90 else 14):
+            if frame_type == 0x90:
+                src_addr = frame_data[1:9].hex().upper()
+                rf_data = bytes(frame_data[12:])
             else:
-                self.tx_fail += 1
+                src_addr = frame_data[2:10].hex().upper()
+                rf_data = bytes(frame_data[14:])
+            self.last_src = src_addr
+
+            # Accept if remote_addr is empty, broadcast (FFFF), or matches sender (ignore filter on 0x10 loopback)
+            if (frame_type == 0x90 and
+                self.remote_addr and 
+                not self.remote_addr.endswith('FFFF') and 
+                self.remote_addr != src_addr):
+                self.rx_ignored += 1
+                return
+
+            self.rx += 1
+            if self.on_message:
+                self.on_message(rf_data)
+
+        # 0x88 = AT Command Response
+        elif frame_type == 0x88 and len(frame_data) >= 5:
+            cmd = frame_data[2:4]
+            status = frame_data[4]
+            data = frame_data[5:]
+            if status == 0:
+                if cmd == b'SH':
+                    self._sh = data.hex().upper()
+                elif cmd == b'SL':
+                    self._sl = data.hex().upper()
+                    if hasattr(self, '_sh'):
+                        self.local_addr = self._sh + self._sl
 
     def close(self):
-        dev, self.dev = self.dev, None
+        self.running = False
+        ser, self.ser = self.ser, None
         try:
-            if dev and dev.is_open():
-                dev.close()
-        except Exception:  # noqa: BLE001
+            if ser and ser.is_open:
+                ser.close()
+        except Exception:
             pass

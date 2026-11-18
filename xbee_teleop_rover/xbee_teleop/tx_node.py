@@ -17,7 +17,7 @@ class TxNode(Node):
         super().__init__('tx_node')
         for k, v in dict(
             port='/dev/ttyUSB0', baud=115200, remote_addr='', send_rate_hz=20.0,
-            cmd_timeout=0.5, axis_linear=1, axis_angular=0, enable_button=4,
+            cmd_timeout=0.5, axis_linear=1, axis_angular=2, enable_button=4,
             scale_linear=0.5, scale_angular=1.0, require_enable=False
         ).items():
             self.declare_parameter(k, v)
@@ -46,10 +46,19 @@ class TxNode(Node):
 
         btns, contract, expand, gripper = get_controller_state(msg.buttons, msg.axes)
 
+        axis_lin = p('axis_linear')
+        axis_ang = p('axis_angular')
+        # Standard Linux xpad Xbox pad has <= 12 buttons and > 5 axes (axis 2 is LT trigger, axis 3 is RX).
+        # Generic HID pads (e.g. 19-button Zikway) have axis 2 as RX.
+        if axis_ang == 2 and len(msg.buttons) <= 12 and len(msg.axes) > 5:
+            axis_ang = 3
+
         self.enable = bool(g(msg.buttons, p('enable_button'))) or btns['LB']
         if self.enable or not p('require_enable'):
-            self.vx = p('scale_linear') * g(msg.axes, p('axis_linear'))
-            self.wz = p('scale_angular') * g(msg.axes, p('axis_angular'))
+            # Left throttle (Left Stick Y) strictly controls front and back speed (vx); left/right is ignored.
+            self.vx = p('scale_linear') * g(msg.axes, axis_lin)
+            # Right throttle (Right Stick X) strictly controls left/right turning (wz); front/back is ignored.
+            self.wz = p('scale_angular') * g(msg.axes, axis_ang)
         else:
             self.vx = self.wz = 0.0
 

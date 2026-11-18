@@ -1,12 +1,22 @@
-# remote_addr = 64-bit address of the OTHER radio.
-#   TX radio (gamepad PC): 0013A200425DD789
-#   RX radio (robot)     : 0013A200425E9501
-# Both radios: AP=1 (API mode), BD=7 (115200), ID=3196.
+# =============================================================================
+# ROS 2 PARAMETER FILE — xbee_teleop package
+#
+# IMPORTANT: ROS 2 YAML cannot import Python. All values here MUST be kept
+# manually in sync with rover/src/comms_config.py.
+# Edit comms_config.py first, then mirror any changes here.
+#
+# Radio 64-bit addresses (from comms_config.py):
+#   TX radio (gamepad PC): 0013A200425DD789  → BASE_RADIO_ADDR_TX
+#   RX radio (rover)     : 0013A200425E9501  → ROVER_RADIO_ADDR_RX
+#   Rover XBee TX addr   : 0013A200425E94FF  → ROVER_RADIO_ADDR_TX
+# PAN ID: 3196 (0x0C7C)  → XBEE_PAN_ID
+# Both radios: AP=1 (API mode), BD=7 (115200 baud)
+# =============================================================================
 joy_node:
   ros__parameters:
     device_id: 0
-    deadzone: 0.05
-    autorepeat_rate: 20.0
+    deadzone: 0.05            # JOY_DEADZONE
+    autorepeat_rate: 20.0     # JOY_AUTOREPEAT_RATE
 
 tx_node:                          # PC with the gamepad
   ros__parameters:
@@ -15,8 +25,8 @@ tx_node:                          # PC with the gamepad
     remote_addr: "0013A200425E94FF"
     send_rate_hz: 20.0
     cmd_timeout: 0.5
-    axis_linear: 1
-    axis_angular: 0
+    axis_linear: 1            # Left Stick Y -> front/back linear speed (vx)
+    axis_angular: 2           # Right Stick X -> left/right angular turning (wz)
     enable_button: 4
     require_enable: false       # <-- add this: no LB needed, stick alone drives
     scale_linear: 0.5
